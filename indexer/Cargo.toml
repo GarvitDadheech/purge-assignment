@@ -9,3 +9,12 @@ tonic = "0.14.2"
 bytes = "1.10.1"
 futures = "0.3.31"
 yellowstone-grpc-proto = "9.0.0"
+store = { path = "../store" }
+dotenv = "0.15.0"
+log = "0.4.22"
+env_logger = "0.11.4"
+bs58 = "0.5.1"
+spl-token = "8.0.0"
+thiserror = "2.0.16"
+
+[workspace]

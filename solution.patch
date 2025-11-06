@@ -1,0 +1,2336 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..c41cc9e
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1 @@
++/target
+\ No newline at end of file
+diff --git a/Cargo.lock b/Cargo.lock
+index ca7e893..79c8769 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -478,13 +478,13 @@ checksum = "55248b47b0caf0546f7988906588779981c43bb1bc9d0c44087278f80cdb44ba"
+ 
+ [[package]]
+ name = "bcrypt"
+-version = "0.15.1"
++version = "0.17.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e65938ed058ef47d92cf8b346cc76ef48984572ade631927e9937b5ffc7662c7"
++checksum = "abaf6da45c74385272ddf00e1ac074c7d8a6c1a1dda376902bd6a427522a8b2c"
+ dependencies = [
+  "base64 0.22.1",
+  "blowfish",
+- "getrandom 0.2.16",
++ "getrandom 0.3.3",
+  "subtle",
+  "zeroize",
+ ]
+@@ -4611,6 +4611,8 @@ version = "0.1.0"
+ dependencies = [
+  "bcrypt",
+  "chrono",
++ "serde",
++ "serde_json",
+  "sqlx",
+  "tokio",
+  "uuid",
+@@ -5097,6 +5099,7 @@ checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
+ dependencies = [
+  "getrandom 0.3.3",
+  "js-sys",
++ "serde",
+  "wasm-bindgen",
+ ]
+ 
+diff --git a/backend/.gitignore b/backend/.gitignore
+index ea8c4bf..0b745e2 100644
+--- a/backend/.gitignore
++++ b/backend/.gitignore
+@@ -1 +1,2 @@
+ /target
++.env
+\ No newline at end of file
+diff --git a/backend/Cargo.toml b/backend/Cargo.toml
+index 3219603..a421982 100644
+--- a/backend/Cargo.toml
++++ b/backend/Cargo.toml
+@@ -5,6 +5,19 @@ edition = "2024"
+ 
+ [dependencies]
+ actix-web = "4.11.0"
+-tokio = "1.47.1"
++tokio = { version = "1.47.1", features = ["full"] }
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
++store = { path = "../store" }
++mpc = { path = "../mpc" }
++sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "offline"] }
++jsonwebtoken = "9.3.0"
++reqwest = { version = "0.12.5", features = ["json"] }
++chrono = { version = "0.4", features = ["serde"] }
++dotenv = "0.15.0"
++solana-sdk = "3.0.0"
++log = "0.4.22"
++env_logger = "0.11.4"
++bcrypt = "0.17.1"
++uuid = { version = "1.10.0", features = ["v4", "serde"] }
++actix-web-lab = "0.24.3"
+diff --git a/backend/src/auth.rs b/backend/src/auth.rs
+new file mode 100644
+index 0000000..81ba260
+--- /dev/null
++++ b/backend/src/auth.rs
+@@ -0,0 +1,43 @@
++use chrono::{Duration, Utc};
++use jsonwebtoken::{decode, encode, EncodingKey, Header, DecodingKey, Validation};
++use serde::{Deserialize, Serialize};
++use std::env;
++use uuid::Uuid;
++
++#[derive(Debug, Serialize, Deserialize)]
++pub struct Claims {
++    pub sub: Uuid,
++    pub exp: usize,
++}
++
++pub fn create_jwt(user_id: Uuid) -> Result<String, jsonwebtoken::errors::Error> {
++    let expiration = Utc::now()
++        .checked_add_signed(Duration::days(7))
++        .expect("valid timestamp")
++        .timestamp();
++
++    let claims = Claims {
++        sub: user_id,
++        exp: expiration as usize,
++    };
++
++    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
++    let token = encode(
++        &Header::default(),
++        &claims,
++        &EncodingKey::from_secret(secret.as_ref()),
++    )?;
++
++    Ok(token)
++}
++
++pub fn decode_jwt(token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
++    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
++    let token = decode::<Claims>(
++        token,
++        &DecodingKey::from_secret(secret.as_ref()),
++        &Validation::default(),
++    )?;
++
++    Ok(token.claims)
++}
+diff --git a/backend/src/main.rs b/backend/src/main.rs
+index a6f5f26..fc60e49 100644
+--- a/backend/src/main.rs
++++ b/backend/src/main.rs
+@@ -1,19 +1,40 @@
+-use actix_web::{App, HttpServer};
++use actix_web::{web, App, HttpServer};
++use dotenv::dotenv;
++use sqlx::PgPool;
++use std::env;
++use store::Store;
+ 
+ mod routes;
++mod middleware;
++
+ use routes::*;
+ 
+ #[actix_web::main]
+ async fn main() -> std::io::Result<()> {
+-    HttpServer::new(|| {
++    dotenv().ok();
++    env_logger::init();
++
++    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
++    let pool = PgPool::connect(&database_url)
++        .await
++        .expect("Failed to create pool.");
++    let store = Store::new(pool);
++    let store_data = web::Data::new(store);
++
++    HttpServer::new(move || {
+         App::new()
+-            .service(sign_up)  
+-            .service(sign_in)
+-            .service(get_user)
+-            .service(quote)
+-            .service(swap)
+-            .service(sol_balance)
+-            .service(token_balance)
++            .app_data(store_data.clone())
++            .service(
++                web::scope("/api/v1")
++                    .service(sign_up)
++                    .service(sign_in)
++                    .service(get_user)
++                    .service(quote)
++                    .service(swap)
++                    .service(send)
++                    .service(sol_balance)
++                    .service(token_balance),
++            )
+     })
+     .bind("127.0.0.1:8080")?
+     .run()
+diff --git a/backend/src/middleware.rs b/backend/src/middleware.rs
+new file mode 100644
+index 0000000..c5b79ad
+--- /dev/null
++++ b/backend/src/middleware.rs
+@@ -0,0 +1,35 @@
++use actix_web::{
++    dev::Payload,
++    error::ErrorUnauthorized,
++    http, FromRequest, HttpRequest,
++};
++use serde::{Deserialize, Serialize};
++use std::future::{ready, Ready};
++use uuid::Uuid;
++use crate::auth::decode_jwt;
++
++#[derive(Debug, Serialize, Deserialize)]
++pub struct AuthenticatedUser {
++    pub id: Uuid,
++}
++
++impl FromRequest for AuthenticatedUser {
++    type Error = actix_web::Error;
++    type Future = Ready<Result<Self, Self::Error>>;
++
++    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
++        let auth_header = req.headers().get(http::header::AUTHORIZATION);
++
++        if let Some(auth_header) = auth_header {
++            if let Ok(auth_str) = auth_header.to_str() {
++                if auth_str.starts_with("Bearer ") {
++                    let token = &auth_str[7..];
++                    if let Ok(claims) = decode_jwt(token) {
++                        return ready(Ok(AuthenticatedUser { id: claims.sub }));
++                    }
++                }
++            }
++        }
++        ready(Err(ErrorUnauthorized("Invalid token")))
++    }
++}
+diff --git a/backend/src/routes/mod.rs b/backend/src/routes/mod.rs
+index 810f7d4..2167a84 100644
+--- a/backend/src/routes/mod.rs
++++ b/backend/src/routes/mod.rs
+@@ -1,5 +1,7 @@
+ pub mod user;
+ pub mod solana;
++pub mod auth;
+ 
+ pub use user::*;
+ pub use solana::*;
++pub use auth::*;
+diff --git a/backend/src/routes/solana.rs b/backend/src/routes/solana.rs
+index cee520e..aaa8bf2 100644
+--- a/backend/src/routes/solana.rs
++++ b/backend/src/routes/solana.rs
+@@ -1,61 +1,332 @@
+ use actix_web::{web, HttpResponse, Result};
+ use serde::{Deserialize, Serialize};
++use uuid::Uuid;
++use crate::middleware::AuthenticatedUser;
++use store::Store;
++use mpc::serialization::{AggMessage1, PartialSignature};
+ 
+ #[derive(Deserialize)]
+ pub struct QuoteRequest {
++    #[serde(rename = "inputMint")]
++    pub input_mint: String,
++    #[serde(rename = "outputMint")]
++    pub output_mint: String,
++    #[serde(rename = "inAmount")]
++    pub in_amount: u64,
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+ pub struct QuoteResponse {
++    #[serde(rename = "outAmount")]
++    pub out_amount: String,
++    pub id: Uuid,
+ }
+ 
+-
+ #[derive(Deserialize)]
+ pub struct SwapRequest {
++    pub id: Uuid,
+ }
+ 
+ #[derive(Serialize)]
+ pub struct SwapResponse {
++    #[serde(rename = "swapTransaction")]
++    pub swap_transaction: String,
+ }
+ 
+ #[derive(Serialize)]
+ pub struct BalanceResponse {
++    pub balance: u64,
++}
++
++#[derive(Serialize, Clone)]
++pub struct TokenBalance {
++    pub balance: u64,
++    #[serde(rename = "tokenMint")]
++    pub token_mint: String,
++    pub symbol: String,
++    pub decimals: i32,
+ }
+ 
+ #[derive(Serialize)]
+ pub struct TokenBalanceResponse {
++    pub balances: Vec<TokenBalance>,
++}
++
++#[derive(Deserialize)]
++pub struct SendRequest {
++    pub to: String,
++    pub amount: u64,
++    pub mint: Option<String>,
++}
++
++#[derive(Serialize)]
++pub struct SendResponse {
++    pub signature: String,
++}
++
++#[derive(Serialize)]
++struct JupiterSwapRequest {
++    #[serde(rename = "userPublicKey")]
++    user_public_key: String,
++    #[serde(rename = "quoteResponse")]
++    quote_response: serde_json::Value,
+ }
+ 
+ #[actix_web::post("/quote")]
+-pub async fn quote(req: web::Json<QuoteRequest>) -> Result<HttpResponse> {
+-    let response = QuoteResponse {};
+-    
+-    Ok(HttpResponse::Ok().json(response))
++pub async fn quote(
++    store: web::Data<Store>,
++    user: AuthenticatedUser,
++    req: web::Json<QuoteRequest>,
++) -> Result<HttpResponse> {
++    let client = reqwest::Client::new();
++    let url = format!(
++        "https://lite-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=50",
++        req.input_mint, req.output_mint, req.in_amount
++    );
++
++    match client.get(&url).send().await {
++        Ok(response) => {
++            if response.status().is_success() {
++                match response.json::<serde_json::Value>().await {
++                    Ok(quote_response) => {
++                        match store
++                            .create_quote(user.id, quote_response.clone())
++                            .await
++                        {
++                            Ok(stored_quote) => {
++                                let out_amount = quote_response["outAmount"]
++                                    .as_str()
++                                    .unwrap_or_default()
++                                    .to_string();
++                                let response = QuoteResponse {
++                                    out_amount,
++                                    id: stored_quote.id,
++                                };
++                                Ok(HttpResponse::Ok().json(response))
++                            }
++                            Err(_) => Ok(HttpResponse::InternalServerError().finish()),
++                        }
++                    }
++                    Err(_) => Ok(HttpResponse::InternalServerError().finish()),
++                }
++            } else {
++                Ok(HttpResponse::InternalServerError().finish())
++            }
++        }
++        Err(_) => Ok(HttpResponse::InternalServerError().finish()),
++    }
+ }
+ 
+ #[actix_web::post("/swap")]
+-pub async fn swap(req: web::Json<SwapRequest>) -> Result<HttpResponse> {
++pub async fn swap(
++    store: web::Data<Store>,
++    user: AuthenticatedUser,
++    req: web::Json<SwapRequest>,
++) -> Result<HttpResponse> {
++    let user_model = match store.get_user_by_id(user.id).await {
++        Ok(Some(user)) => user,
++        _ => return Ok(HttpResponse::InternalServerError().finish()),
++    };
++
++    let quote = match store.get_quote(req.id).await {
++        Ok(Some(quote)) => quote,
++        _ => return Ok(HttpResponse::NotFound().finish()),
++    };
++
++    let swap_request_body = JupiterSwapRequest {
++        user_public_key: user_model.public_key.clone(),
++        quote_response: quote.quote_response,
++    };
++
++    let client = reqwest::Client::new();
++    let url = "https://lite-api.jup.ag/v6/swap";
++
++    let jupiter_res = client.post(url).json(&swap_request_body).send().await.unwrap().json::<serde_json::Value>().await.unwrap();
++    let swap_transaction = jupiter_res["swapTransaction"].as_str().unwrap().to_string();
++
++    // Now sign the transaction with MPC
++    let mpc_service_url = std::env::var("MPC_SERVICE_URL").expect("MPC_SERVICE_URL must be set");
++
++    // Step 1: Call agg-send-step1 on node 1
++    let step1_req = serde_json::json!({
++        "end_user_pubkey": user_model.public_key,
++        "node_id": 1,
++        "to": "11111111111111111111111111111111", // Placeholder
++        "amount": 0, // Placeholder
++        "transaction": swap_transaction
++    });
++
++    let step1_res = client
++        .post(format!("{}/agg-send-step1", mpc_service_url))
++        .json(&step1_req)
++        .send()
++        .await
++        .unwrap()
++        .json::<serde_json::Value>()
++        .await
++        .unwrap();
++
++    let session_id: Uuid = serde_json::from_value(step1_res["session_id"].clone()).unwrap();
++    let agg_message_1: AggMessage1 = serde_json::from_value(step1_res["agg_message_1"].clone()).unwrap();
++
++    // Step 2: Call agg-send-step2 on node 2
++    let step2_req = serde_json::json!({
++        "session_id": session_id,
++        "node_id": 2,
++        "agg_message_1": agg_message_1
++    });
++
++    let step2_res = client
++        .post(format!("{}/agg-send-step2", mpc_service_url))
++        .json(&step2_req)
++        .send()
++        .await
++        .unwrap()
++        .json::<serde_json::Value>()
++        .await
++        .unwrap();
+     
+-    let response = SwapResponse {};
++    let partial_signature_2: PartialSignature = serde_json::from_value(step2_res["partial_signature"].clone()).unwrap();
++    let agg_message_2: AggMessage1 = serde_json::from_value(step2_res["agg_message_2"].clone()).unwrap();
++
++    // Step 3: Call aggregate-signatures-broadcast on node 1
++    let broadcast_req = serde_json::json!({
++        "session_id": session_id,
++        "partial_signature_2": partial_signature_2,
++        "agg_message_2": agg_message_2
++    });
++
++    let broadcast_res = client
++        .post(format!("{}/aggregate-signatures-broadcast", mpc_service_url))
++        .json(&broadcast_req)
++        .send()
++        .await
++        .unwrap()
++        .json::<serde_json::Value>()
++        .await
++        .unwrap();
+     
+-    Ok(HttpResponse::Ok().json(response))
++    let signature = broadcast_res["transaction_signature"].as_str().unwrap().to_string();
++
++    Ok(HttpResponse::Ok().json(SwapResponse { swap_transaction: signature }))
+ }
+ 
+-#[actix_web::get("/sol-balance/{pubkey}")]
+-pub async fn sol_balance() -> Result<HttpResponse> {
+-    
+-    let response = BalanceResponse {
+-    };
++#[actix_web::post("/send")]
++pub async fn send(
++    store: web::Data<Store>,
++    user: AuthenticatedUser,
++    req: web::Json<SendRequest>,
++) -> Result<HttpResponse> {
++    let user_model = store.get_user_by_id(user.id).await.unwrap().unwrap();
++    let mpc_service_url = std::env::var("MPC_SERVICE_URL").expect("MPC_SERVICE_URL must be set");
++
++    let client = reqwest::Client::new();
++
++    // Step 1: Call agg-send-step1 on node 1
++    let step1_req = serde_json::json!({
++        "end_user_pubkey": user_model.public_key,
++        "node_id": 1,
++        "to": req.to,
++        "amount": req.amount as f64 / 1e9, // Convert lamports to SOL
++        "memo": req.mint
++    });
++
++    let step1_res = client
++        .post(format!("{}/agg-send-step1", mpc_service_url))
++        .json(&step1_req)
++        .send()
++        .await
++        .unwrap()
++        .json::<serde_json::Value>()
++        .await
++        .unwrap();
++
++    let session_id: Uuid = serde_json::from_value(step1_res["session_id"].clone()).unwrap();
++    let agg_message_1: AggMessage1 = serde_json::from_value(step1_res["agg_message_1"].clone()).unwrap();
++
++    // Step 2: Call agg-send-step2 on node 2
++    let step2_req = serde_json::json!({
++        "session_id": session_id,
++        "node_id": 2,
++        "agg_message_1": agg_message_1
++    });
++
++    let step2_res = client
++        .post(format!("{}/agg-send-step2", mpc_service_url))
++        .json(&step2_req)
++        .send()
++        .await
++        .unwrap()
++        .json::<serde_json::Value>()
++        .await
++        .unwrap();
+     
+-    Ok(HttpResponse::Ok().json(response))
++    let partial_signature_2: PartialSignature = serde_json::from_value(step2_res["partial_signature"].clone()).unwrap();
++    let agg_message_2: AggMessage1 = serde_json::from_value(step2_res["agg_message_2"].clone()).unwrap();
++
++    // Step 3: Call aggregate-signatures-broadcast on node 1
++    let broadcast_req = serde_json::json!({
++        "session_id": session_id,
++        "partial_signature_2": partial_signature_2,
++        "agg_message_2": agg_message_2
++    });
++
++    let broadcast_res = client
++        .post(format!("{}/aggregate-signatures-broadcast", mpc_service_url))
++        .json(&broadcast_req)
++        .send()
++        .await
++        .unwrap()
++        .json::<serde_json::Value>()
++        .await
++        .unwrap();
++
++    let signature = broadcast_res["transaction_signature"].as_str().unwrap().to_string();
++
++    Ok(HttpResponse::Ok().json(SendResponse { signature }))
+ }
+ 
+-#[actix_web::get("/token-balance/{pubkey}/{mint}")]
+-pub async fn token_balance() -> Result<HttpResponse> {    
+-    
+-    let response = TokenBalanceResponse {
+-        
+-    };
+-    
+-    Ok(HttpResponse::Ok().json(response))
++#[actix_web::get("/balance/sol")]
++pub async fn sol_balance(
++    store: web::Data<Store>,
++    user: AuthenticatedUser,
++) -> Result<HttpResponse> {
++    match store.get_sol_balance(user.id).await {
++        Ok(Some(balance)) => {
++            let response = BalanceResponse {
++                balance: balance.amount as u64,
++            };
++            Ok(HttpResponse::Ok().json(response))
++        }
++        Ok(None) => {
++            let response = BalanceResponse { balance: 0 };
++            Ok(HttpResponse::Ok().json(response))
++        }
++        Err(_) => Ok(HttpResponse::InternalServerError().finish()),
++    }
++}
++
++#[actix_web::get("/balance/tokens")]
++pub async fn token_balance(
++    store: web::Data<Store>,
++    user: AuthenticatedUser,
++) -> Result<HttpResponse> {
++    match store.get_token_balances(user.id).await {
++        Ok(balances) => {
++            let token_balances = balances
++                .into_iter()
++                .map(|(balance, asset)| TokenBalance {
++                    balance: balance.amount as u64,
++                    token_mint: asset.mint_address,
++                    symbol: asset.symbol,
++                    decimals: asset.decimals,
++                })
++                .collect();
++            let response = TokenBalanceResponse {
++                balances: token_balances,
++            };
++            Ok(HttpResponse::Ok().json(response))
++        }
++        Err(_) => Ok(HttpResponse::InternalServerError().finish()),
++    }
+ }
+diff --git a/backend/src/routes/user.rs b/backend/src/routes/user.rs
+index 744f978..27f99f3 100644
+--- a/backend/src/routes/user.rs
++++ b/backend/src/routes/user.rs
+@@ -1,5 +1,11 @@
+ use actix_web::{web, HttpResponse, Result};
+ use serde::{Deserialize, Serialize};
++use solana_sdk::signer::{keypair::Keypair, Signer};
++use store::user::CreateUserRequest;
++use store::Store;
++use crate::auth::create_jwt;
++use bcrypt::verify;
++use crate::middleware::AuthenticatedUser;
+ 
+ #[derive(Deserialize)]
+ pub struct SignUpRequest {
+@@ -15,6 +21,7 @@ pub struct SignInRequest {
+ 
+ #[derive(Serialize)]
+ pub struct UserResponse {
++    pub email: String,
+ }
+ 
+ #[derive(Serialize)]
+@@ -28,30 +35,66 @@ pub struct SignupResponse {
+ }
+ 
+ #[actix_web::post("/signup")]
+-pub async fn sign_up(req: web::Json<SignUpRequest>) -> Result<HttpResponse> {
+-    let response = SignupResponse {
+-        message: "User created successfully".to_string(),
++pub async fn sign_up(
++    store: web::Data<Store>,
++    req: web::Json<SignUpRequest>,
++) -> Result<HttpResponse> {
++    let keypair = Keypair::new();
++    let public_key = keypair.pubkey().to_string();
++
++    let create_user_request = CreateUserRequest {
++        email: req.email.clone(),
++        password: req.password.clone(),
++        public_key: public_key.clone(),
+     };
+-    
+-    Ok(HttpResponse::Created().json(response))
++
++    match store.create_user(create_user_request).await {
++        Ok(_) => {
++            if let Err(e) = store.add_public_key(&public_key).await {
++                // TODO: Handle this error case more gracefully
++                log::error!("Failed to add public key to watch list: {}", e);
++            }
++            let response = SignupResponse {
++                message: "User created successfully".to_string(),
++            };
++            Ok(HttpResponse::Created().json(response))
++        }
++        Err(e) => Ok(HttpResponse::InternalServerError().json(e.to_string())),
++    }
+ }
+ 
+ #[actix_web::post("/signin")]
+-pub async fn sign_in(req: web::Json<SignInRequest>) -> Result<HttpResponse> {
+-    let response = AuthResponse {
+-        token: "temporary_token".to_string(),
++pub async fn sign_in(
++    store: web::Data<Store>,
++    req: web::Json<SignInRequest>,
++) -> Result<HttpResponse> {
++    let user = match store.get_user_by_email(&req.email).await {
++        Ok(Some(user)) => user,
++        Ok(None) => return Ok(HttpResponse::Unauthorized().finish()),
++        Err(_) => return Ok(HttpResponse::InternalServerError().finish()),
+     };
+-    
+-    Ok(HttpResponse::Ok().json(response))
++
++    match verify(&req.password, &user.password_hash) {
++        Ok(true) => {
++            let token = create_jwt(user.id).unwrap();
++            let response = AuthResponse { token };
++            Ok(HttpResponse::Ok().json(response))
++        }
++        _ => Ok(HttpResponse::Unauthorized().finish()),
++    }
+ }
+ 
+-#[actix_web::get("/user/{id}")]
+-pub async fn get_user(path: web::Path<u32>) -> Result<HttpResponse> {
+-    let user_id = path.into_inner();
+-    
+-    let user = UserResponse {
+-       
+-    };
+-    
+-    Ok(HttpResponse::Ok().json(user))
++#[actix_web::get("/user")]
++pub async fn get_user(
++    store: web::Data<Store>,
++    user: AuthenticatedUser,
++) -> Result<HttpResponse> {
++    match store.get_user_by_id(user.id).await {
++        Ok(Some(user)) => {
++            let user_response = UserResponse { email: user.email };
++            Ok(HttpResponse::Ok().json(user_response))
++        }
++        Ok(None) => Ok(HttpResponse::NotFound().finish()),
++        Err(_) => Ok(HttpResponse::InternalServerError().finish()),
++    }
+ }
+diff --git a/indexer/Cargo.toml b/indexer/Cargo.toml
+index 48fa0ee..b176d81 100644
+--- a/indexer/Cargo.toml
++++ b/indexer/Cargo.toml
+@@ -9,3 +9,12 @@ tonic = "0.14.2"
+ bytes = "1.10.1"
+ futures = "0.3.31"
+ yellowstone-grpc-proto = "9.0.0"
++store = { path = "../store" }
++dotenv = "0.15.0"
++log = "0.4.22"
++env_logger = "0.11.4"
++bs58 = "0.5.1"
++spl-token = "8.0.0"
++thiserror = "2.0.16"
++
++[workspace]
+diff --git a/indexer/src/main.rs b/indexer/src/main.rs
+index 74ef4c4..b774bf8 100644
+--- a/indexer/src/main.rs
++++ b/indexer/src/main.rs
+@@ -1,12 +1,169 @@
++use dotenv::dotenv;
++use futures::StreamExt;
++use log::{error, info};
++use spl_token::state::Account as TokenAccount;
++use sqlx::PgPool;
++use std::{collections::HashMap, env, str::FromStr};
++use store::Store;
+ use yellowstone::GeyserGrpcClient;
++use yellowstone_grpc_proto::prelude::{subscribe_update::UpdateOneof, SubscribeUpdateAccount};
++
+ pub mod yellowstone;
+ 
+ #[tokio::main]
+-async fn main() {   
+-    let client = GeyserGrpcClient::new(HealthClient::new(), GeyserClient::new());
+-    client.health_check().await;
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    dotenv().ok();
++    env_logger::init();
++
++    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
++    let triton_api_token = env::var("TRITON_API_TOKEN").expect("TRITON_API_TOKEN must be set");
++
++    let pool = PgPool::connect(&database_url).await?;
++    let store = Store::new(pool);
++
++    let public_keys = store.get_all_public_keys().await?;
++    let addresses_to_monitor: Vec<String> = public_keys
++        .into_iter()
++        .map(|pk| pk.end_user_pubkey)
++        .collect();
++
++    if addresses_to_monitor.is_empty() {
++        info!("No public keys to monitor. Exiting.");
++        return Ok(());
++    }
++
++    info!("Monitoring {} addresses", addresses_to_monitor.len());
++
++    let mut client = GeyserGrpcClient::build_from_static("https://grpc.triton.one:443")
++        .x_token(Some(&triton_api_token))?
++        .connect()
++        .await?;
++
++    let (_sink, mut stream) = client
++        .subscribe_to_addresses(addresses_to_monitor.clone())
++        .await?;
++
++    info!("Successfully subscribed to addresses. Waiting for updates...");
++
++    let addresses_set: std::collections::HashSet<String> =
++        addresses_to_monitor.into_iter().collect();
++
++    while let Some(update) = stream.next().await {
++        match update {
++            Ok(update) => {
++                if let Some(UpdateOneof::Account(account_update)) = update.update_oneof {
++                    if let Err(e) = handle_account_update(&store, &addresses_set, account_update).await {
++                        error!("Error handling account update: {}", e);
++                    }
++                }
++            }
++            Err(e) => {
++                error!("Stream error: {}", e);
++            }
++        }
++    }
++
++    Ok(())
++}
++
++async fn handle_account_update(
++    store: &Store,
++    monitored_addresses: &std::collections::HashSet<String>,
++    account_update: SubscribeUpdateAccount,
++) -> Result<(), Box<dyn std::error::Error>> {
++    if let Some(account) = account_update.account {
++        let pubkey_str = bs58::encode(&account.pubkey).into_string();
++
++        // Check if this is a direct SOL balance update for one of our users
++        if monitored_addresses.contains(&pubkey_str) {
++            handle_sol_balance_update(store, &pubkey_str, account.lamports).await?;
++        }
+ 
+-    
++        // Check if this is a token account update
++        if account.owner == spl_token::ID.to_bytes().to_vec() {
++            if let Ok(token_account) = TokenAccount::unpack(&account.data) {
++                let owner_pubkey_str = bs58::encode(&token_account.owner).into_string();
++                if monitored_addresses.contains(&owner_pubkey_str) {
++                    handle_token_balance_update(store, &owner_pubkey_str, token_account).await?;
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++async fn handle_sol_balance_update(
++    store: &Store,
++    pubkey: &str,
++    lamports: u64,
++) -> Result<(), Box<dyn std::error::Error>> {
++    let user = match store.get_user_by_public_key(pubkey).await? {
++        Some(u) => u,
++        None => {
++            error!("SOL balance update for a public key not associated with any user: {}", pubkey);
++            return Ok(());
++        }
++    };
++
++    let sol_asset = store
++        .upsert_asset("So11111111111111111111111111111111111111112", 9, "Solana", "SOL")
++        .await?;
++
++    store
++        .upsert_balance(user.id, sol_asset.id, lamports as i64)
++        .await?;
++
++    info!("Updated SOL balance for {}: {} SOL", pubkey, lamports as f64 / 1e9);
++
++    Ok(())
++}
++
++async fn handle_token_balance_update(
++    store: &Store,
++    owner_pubkey: &str,
++    token_account: TokenAccount,
++) -> Result<(), Box<dyn std::error::Error>> {
++    let user = match store.get_user_by_public_key(owner_pubkey).await? {
++        Some(u) => u,
++        None => {
++             error!("Token balance update for a public key not associated with any user: {}", owner_pubkey);
++            return Ok(());
++        }
++    };
++
++    let mint_address = bs58::encode(&token_account.mint).into_string();
++    let (name, symbol) = get_token_metadata(&mint_address);
++
++    let asset = store
++        .upsert_asset(&mint_address, token_account.mint.get_decimals()? as i32, &name, &symbol)
++        .await?;
++
++    store
++        .upsert_balance(user.id, asset.id, token_account.amount as i64)
++        .await?;
++
++    info!(
++        "Updated token balance for {} [{}]: {}",
++        owner_pubkey, symbol, token_account.amount
++    );
++
++    Ok(())
++}
+ 
++fn get_token_metadata(mint_address: &str) -> (String, String) {
++    let mut known_tokens = HashMap::new();
++    known_tokens.insert(
++        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
++        ("USD Coin".to_string(), "USDC".to_string()),
++    );
++    known_tokens.insert(
++        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
++        ("Tether".to_string(), "USDT".to_string()),
++    );
+ 
++    if let Some(metadata) = known_tokens.get(mint_address) {
++        metadata.clone()
++    } else {
++        (format!("Unknown Token"), format!("UNKNOWN-{}", &mint_address[..4]))
++    }
+ }
+diff --git a/indexer/src/yellowstone.rs b/indexer/src/yellowstone.rs
+index 7d5e6c4..cf755da 100644
+--- a/indexer/src/yellowstone.rs
++++ b/indexer/src/yellowstone.rs
+@@ -21,6 +21,8 @@ use {
+         GetSlotRequest, GetSlotResponse, GetVersionRequest, GetVersionResponse,
+         IsBlockhashValidRequest, IsBlockhashValidResponse, PingRequest, PongResponse,
+         SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest, SubscribeUpdate,
++        subscribe_request_filter_accounts_filter, SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
++        subscribe_request_filter_accounts_filter_memcmp,
+     },
+ };
+ 
+@@ -204,6 +206,60 @@ impl<F: Interceptor> GeyserGrpcClient<F> {
+         let response = self.geyser.get_version(request).await?;
+         Ok(response.into_inner())
+     }
++
++    pub async fn subscribe_to_addresses(
++        &mut self,
++        addresses: Vec<String>,
++    ) -> GeyserGrpcClientResult<(
++        impl Sink<SubscribeRequest, Error = mpsc::SendError>,
++        impl Stream<Item = Result<SubscribeUpdate, Status>>,
++    )> {
++        let mut accounts_filter = std::collections::HashMap::new();
++
++        // Subscribe to all monitored addresses for lamport changes
++        for (i, address) in addresses.iter().enumerate() {
++            accounts_filter.insert(
++                format!("address_{}", i),
++                SubscribeRequestFilterAccounts {
++                    account: vec![address.clone()],
++                    owner: vec![],
++                    filters: vec![],
++                },
++            );
++        }
++
++        // Also subscribe to all SPL token accounts owned by our users
++        accounts_filter.insert(
++            "user_token_accounts".to_string(),
++            SubscribeRequestFilterAccounts {
++                account: vec![],
++                owner: vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string()], // SPL Token Program
++                filters: addresses
++                    .iter()
++                    .map(|addr| SubscribeRequestFilterAccountsFilter {
++                        filter: Some(subscribe_request_filter_accounts_filter::Filter::Memcmp(
++                            SubscribeRequestFilterAccountsFilterMemcmp {
++                                offset: 32, // Owner field in token account
++                                data: Some(
++                                    subscribe_request_filter_accounts_filter_memcmp::Data::Base58(
++                                        addr.clone(),
++                                    ),
++                                ),
++                            },
++                        )),
++                    })
++                    .collect(),
++            },
++        );
++
++        let request = SubscribeRequest {
++            accounts: accounts_filter,
++            commitment: Some(CommitmentLevel::Confirmed as i32),
++            ..Default::default()
++        };
++
++        self.subscribe_with_request(Some(request)).await
++    }
+ }
+ 
+ #[derive(Debug, thiserror::Error)]
+diff --git a/mpc/Cargo.toml b/mpc/Cargo.toml
+index 2e79951..a45e7a0 100644
+--- a/mpc/Cargo.toml
++++ b/mpc/Cargo.toml
+@@ -5,4 +5,24 @@ edition = "2024"
+ 
+ [dependencies]
+ actix-web = "4.11.0"
+-tokio = "1.47.1"
++tokio = { version = "1.0", features = ["full"] }
++solana-sdk = "3.0.0"
++multi-party-eddsa = { git = "https://github.com/ZenGo-X/multi-party-eddsa", , branch = "master" }
++curv-kzen = "0.10.0"
++rand = "0.9.2"
++bs58 = "0.5.1"
++serde = { version = "1.0", features = ["derive"] }
++serde_json = "1.0"
++uuid = { version = "1.10.0", features = ["v4", "serde"] }
++sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "offline"] }
++dotenv = "0.15.0"
++log = "0.4.22"
++env_logger = "0.11.4"
++thiserror = "2.0.16"
++store = { path = "../store" }
++solana-client = "3.0.1"
++chrono = "0.4"
++hex = "0.4.3"
++spl-memo = "6.0.0"
++
++[workspace]
+diff --git a/mpc/src/db.rs b/mpc/src/db.rs
+new file mode 100644
+index 0000000..cffd7d2
+--- /dev/null
++++ b/mpc/src/db.rs
+@@ -0,0 +1,167 @@
++use crate::error::Error;
++use chrono::{Duration, Utc};
++use serde::{Deserialize, Serialize};
++use sqlx::{FromRow, PgPool};
++use uuid::Uuid;
++use crate::serialization::SecretAggStepOne;
++
++#[derive(Debug, FromRow)]
++pub struct MpcKey {
++    pub end_user_pubkey: String,
++    pub node_id: i32,
++    pub public_key: String,
++    pub private_key: String, // Encrypted at rest
++}
++
++#[derive(Debug, FromRow, Serialize, Deserialize)]
++pub struct MpcSigningSession {
++    pub session_id: Uuid,
++    pub end_user_pubkey: String,
++    pub secret_state_1: Option<Vec<u8>>,
++    pub secret_state_2: Option<Vec<u8>>,
++    pub partial_sig_2: Option<String>,
++    pub agg_message_2: Option<String>,
++    pub to_address: String,
++    pub amount: f64,
++    pub memo: Option<String>,
++    pub transaction: Option<String>,
++}
++
++#[derive(Clone)]
++pub struct MpcStore {
++    pool: PgPool,
++}
++
++impl MpcStore {
++    pub fn new(pool: PgPool) -> Self {
++        Self { pool }
++    }
++
++    pub async fn store_key(&self, key: &MpcKey) -> Result<(), Error> {
++        sqlx::query!(
++            r#"
++            INSERT INTO mpc_keys (end_user_pubkey, node_id, public_key, private_key)
++            VALUES ($1, $2, $3, $4)
++            "#,
++            key.end_user_pubkey,
++            key.node_id,
++            key.public_key,
++            key.private_key // TODO: Encrypt before storing
++        )
++        .execute(&self.pool)
++        .await?;
++        Ok(())
++    }
++
++    pub async fn get_key(&self, end_user_pubkey: &str, node_id: i32) -> Result<MpcKey, Error> {
++        let key = sqlx::query_as!(
++            MpcKey,
++            r#"
++            SELECT end_user_pubkey, node_id, public_key, private_key FROM mpc_keys
++            WHERE end_user_pubkey = $1 AND node_id = $2
++            "#,
++            end_user_pubkey,
++            node_id
++        )
++        .fetch_one(&self.pool)
++        .await?;
++        Ok(key)
++    }
++
++    pub async fn get_keys_for_user(&self, end_user_pubkey: &str) -> Result<Vec<MpcKey>, Error> {
++        let keys = sqlx::query_as!(
++            MpcKey,
++            r#"
++            SELECT end_user_pubkey, node_id, public_key, private_key FROM mpc_keys
++            WHERE end_user_pubkey = $1
++            ORDER BY node_id
++            "#,
++            end_user_pubkey
++        )
++        .fetch_all(&self.pool)
++        .await?;
++        Ok(keys)
++    }
++
++    pub async fn create_session(
++        &self,
++        end_user_pubkey: &str,
++        secret_state_1: &SecretAggStepOne,
++        to_address: &str,
++        amount: f64,
++        memo: Option<String>,
++        transaction: Option<String>,
++    ) -> Result<Uuid, Error> {
++        let session_id = Uuid::new_v4();
++        let secret_state_1_bytes = serde_json::to_vec(secret_state_1).unwrap();
++        let expires_at = Utc::now() + Duration::minutes(5);
++
++        sqlx::query!(
++            r#"
++            INSERT INTO mpc_signing_sessions 
++            (session_id, end_user_pubkey, secret_state_1, to_address, amount, memo, expires_at, transaction)
++            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
++            "#,
++            session_id,
++            end_user_pubkey,
++            secret_state_1_bytes,
++            to_address,
++            amount,
++            memo,
++            expires_at,
++            transaction
++        )
++        .execute(&self.pool)
++        .await?;
++
++        Ok(session_id)
++    }
++
++    pub async fn update_session_with_step2_data(
++        &self,
++        session_id: Uuid,
++        secret_state_2: &SecretAggStepOne,
++        partial_sig_2: &str,
++        agg_message_2: &str,
++    ) -> Result<(), Error> {
++        let secret_state_2_bytes = serde_json::to_vec(secret_state_2).unwrap();
++        sqlx::query!(
++            r#"
++            UPDATE mpc_signing_sessions
++            SET secret_state_2 = $1, partial_sig_2 = $2, agg_message_2 = $3
++            WHERE session_id = $4
++            "#,
++            secret_state_2_bytes,
++            partial_sig_2,
++            agg_message_2,
++            session_id
++        )
++        .execute(&self.pool)
++        .await?;
++        Ok(())
++    }
++
++    pub async fn get_session(&self, session_id: Uuid) -> Result<MpcSigningSession, Error> {
++        let session = sqlx::query_as!(
++            MpcSigningSession,
++            r#"
++            SELECT 
++                session_id, end_user_pubkey, secret_state_1, secret_state_2,
++                partial_sig_2, agg_message_2, to_address, amount, memo, transaction
++            FROM mpc_signing_sessions
++            WHERE session_id = $1 AND expires_at > NOW()
++            "#,
++            session_id
++        )
++        .fetch_one(&self.pool)
++        .await
++        .map_err(|e| {
++            if let sqlx::Error::RowNotFound = e {
++                Error::SessionNotFound
++            } else {
++                Error::DatabaseError(e)
++            }
++        })?;
++        Ok(session)
++    }
++}
+diff --git a/mpc/src/error.rs b/mpc/src/error.rs
+index e69de29..0fd643f 100644
+--- a/mpc/src/error.rs
++++ b/mpc/src/error.rs
+@@ -0,0 +1,39 @@
++use crate::serialization;
++use solana_client::client_error;
++
++#[derive(Debug, thiserror::Error)]
++pub enum Error {
++    #[error("deserialization failed for field `{field_name}`: {error}")]
++    DeserializationFailed {
++        error: serialization::Error,
++        field_name: &'static str,
++    },
++
++    #[error("mismatch between messages")]
++    MismatchMessages,
++
++    #[error("invalid signature")]
++    InvalidSignature,
++
++    #[error("keypair is not in the list of pubkeys")]
++    KeyPairIsNotInKeys,
++
++    #[error("database error: {0}")]
++    DatabaseError(#[from] sqlx::Error),
++
++    #[error("Solana client error: {0}")]
++    SolanaClientError(#[from] client_error::ClientError),
++
++    #[error("I/O error: {0}")]
++    IoError(#[from] std::io::Error),
++
++    #[error("session not found")]
++    SessionNotFound,
++
++    #[error("key not found for user")]
++    KeyNotFound,
++
++    #[error("invalid request: {0}")]
++    InvalidRequest(String),
++}
++
+diff --git a/mpc/src/main.rs b/mpc/src/main.rs
+index f004c12..83a9e5c 100644
+--- a/mpc/src/main.rs
++++ b/mpc/src/main.rs
+@@ -1,49 +1,320 @@
+-use actix_web::{web::{post}, App, Error, HttpResponse, HttpServer};
++use actix_web::{web::{self, post, Json}, App, HttpResponse, HttpServer, Responder};
++use db::{MpcKey, MpcStore};
++use dotenv::dotenv;
++use error::Error;
++use serde::{Deserialize, Serialize};
++use solana_client::rpc_client::RpcClient;
++use solana_sdk::{
++    hash::Hash,
++    pubkey::Pubkey,
++    signature::{Keypair, Signer},
++    transaction::{Transaction, Message},
++    system_instruction,
++};
++use std::{str::FromStr, sync::Arc};
++use store::Store;
++use uuid::Uuid;
+ 
++use crate::serialization::{AggMessage1, PartialSignature, SecretAggStepOne};
++
++pub mod db;
+ pub mod error;
+ pub mod serialization;
+ pub mod tss;
+ 
+-#[actix_web::main]
+-async fn main() -> Result<(), std::io::Error> {
+-    HttpServer::new(|| {
+-        App::new()
+-        .route("/generate", post().to(generate))
+-        .route("/send-single", post().to(send_single))
+-        .route("/aggregate-keys", post().to(aggregate_keys))
+-        .route("/agg-send-step1", post().to(agg_send_step1))
+-        .route("/agg-send-step2", post().to(agg_send_step2))
+-        .route(
+-            "/aggregate-signatures-broadcast",
+-            post().to(aggregate_signatures_broadcast),
+-        )
+-    })
+-    
+-        .bind("127.0.0.1:8080")?
+-        .run()
+-        .await
++#[derive(Serialize)]
++struct GenerateResponse {
++    end_user_pubkey: String,
++    node1_pubkey: String,
++    node2_pubkey: String,
+ }
+ 
+-async fn generate() -> Result<HttpResponse, Error> {
+-    Ok(HttpResponse::Ok().body("Hello, world!"))
++#[derive(Deserialize)]
++struct AggregateKeysRequest {
++    pubkeys: Vec<String>,
+ }
+ 
+-async fn send_single() -> Result<HttpResponse, Error> {
+-    Ok(HttpResponse::Ok().body("Hello, world!"))
++#[derive(Serialize)]
++struct AggregateKeysResponse {
++    aggregated_pubkey: String,
++}
++
++#[derive(Deserialize)]
++struct AggSendStep1Request {
++    end_user_pubkey: String,
++    node_id: i32,
++    to: String,
++    amount: f64,
++    memo: Option<String>,
++}
++
++#[derive(Serialize)]
++struct AggSendStep1Response {
++    session_id: Uuid,
++    agg_message_1: AggMessage1,
++}
++
++#[derive(Deserialize)]
++struct AggSendStep2Request {
++    session_id: Uuid,
++    node_id: i32,
++    agg_message_1: AggMessage1,
++}
++
++#[derive(Serialize)]
++struct AggSendStep2Response {
++    partial_signature: PartialSignature,
++    agg_message_2: AggMessage1,
++}
++
++#[derive(Deserialize)]
++struct AggregateSignaturesRequest {
++    session_id: Uuid,
++    partial_signature_2: PartialSignature,
++    agg_message_2: AggMessage1,
++}
++
++#[derive(Serialize)]
++struct AggregateSignaturesResponse {
++    transaction_signature: String,
++}
++
++struct AppState {
++    mpc_store_1: MpcStore,
++    mpc_store_2: MpcStore,
++    main_store: Arc<Store>,
++    rpc_client: RpcClient,
++}
++
++impl AppState {
++    fn get_mpc_store(&self, node_id: i32) -> Result<&MpcStore, Error> {
++        match node_id {
++            1 => Ok(&self.mpc_store_1),
++            2 => Ok(&self.mpc_store_2),
++            _ => Err(Error::InvalidRequest("Invalid node_id".to_string())),
++        }
++    }
+ }
+ 
+-async fn aggregate_keys() -> Result<HttpResponse, Error> {
+-    Ok(HttpResponse::Ok().body("Hello, world!"))
++async fn generate(
++    app_state: web::Data<AppState>,
++) -> Result<impl Responder, Error> {
++    let mut rng = rand::thread_rng();
++    let kp1 = Keypair::new(&mut rng);
++    let kp2 = Keypair::new(&mut rng);
++
++    let pubkeys = vec![kp1.pubkey(), kp2.pubkey()];
++    let agg_pk = tss::key_agg(pubkeys, None).unwrap();
++    let end_user_pubkey = Pubkey::new_from_array(agg_pk.agg_public_key.to_bytes(true)).to_string();
++
++    let mpc_store_1 = app_state.get_mpc_store(1)?;
++    let mpc_store_2 = app_state.get_mpc_store(2)?;
++
++    let mpc_key1 = MpcKey {
++        end_user_pubkey: end_user_pubkey.clone(),
++        node_id: 1,
++        public_key: kp1.pubkey().to_string(),
++        private_key: bs58::encode(kp1.to_bytes()).into_string(),
++    };
++    let mpc_key2 = MpcKey {
++        end_user_pubkey: end_user_pubkey.clone(),
++        node_id: 2,
++        public_key: kp2.pubkey().to_string(),
++        private_key: bs58::encode(kp2.to_bytes()).into_string(),
++    };
++
++    mpc_store_1.store_key(&mpc_key1).await?;
++    mpc_store_2.store_key(&mpc_key2).await?;
++
++    app_state.main_store.add_public_key(&end_user_pubkey).await.unwrap();
++
++    Ok(Json(GenerateResponse {
++        end_user_pubkey,
++        node1_pubkey: kp1.pubkey().to_string(),
++        node2_pubkey: kp2.pubkey().to_string(),
++    }))
+ }
+ 
+-async fn agg_send_step1() -> Result<HttpResponse, Error> {
+-    Ok(HttpResponse::Ok().body("Hello, world!"))
++async fn aggregate_keys(req: Json<AggregateKeysRequest>) -> Result<impl Responder, Error> {
++    let pubkeys: Result<Vec<Pubkey>, _> = req
++        .pubkeys
++        .iter()
++        .map(|s| Pubkey::from_str(s))
++        .collect();
++    let pubkeys = pubkeys.map_err(|_| Error::InvalidRequest("Invalid pubkey provided".to_string()))?;
++    let agg_pk = tss::key_agg(pubkeys, None).unwrap();
++    let aggregated_pubkey = Pubkey::new_from_array(agg_pk.agg_public_key.to_bytes(true)).to_string();
++    Ok(Json(AggregateKeysResponse { aggregated_pubkey }))
+ }
+ 
+-async fn agg_send_step2() -> Result<HttpResponse, Error> {
+-    Ok(HttpResponse::Ok().body("Hello, world!"))
++async fn agg_send_step1(
++    app_state: web::Data<AppState>,
++    req: Json<AggSendStep1Request>,
++) -> Result<impl Responder, Error> {
++    let mpc_store = app_state.get_mpc_store(req.node_id)?;
++    let key = mpc_store.get_key(&req.end_user_pubkey, req.node_id).await?;
++    let keypair = Keypair::from_bytes(&bs58::decode(key.private_key).into_vec().unwrap()).unwrap();
++
++    let (agg_message_1, secret_state_1) = tss::step_one(keypair);
++    let session_id = mpc_store
++        .create_session(
++            &req.end_user_pubkey,
++            &secret_state_1,
++            &req.to,
++            req.amount,
++            req.memo.clone(),
++            None, // No generic transaction for SOL send
++        )
++        .await?;
++    
++    Ok(Json(AggSendStep1Response { session_id, agg_message_1 }))
+ }
+ 
+-async fn aggregate_signatures_broadcast() -> Result<HttpResponse, Error> {
+-    Ok(HttpResponse::Ok().body("Hello, world!"))
++async fn agg_send_step2(
++    app_state: web::Data<AppState>,
++    req: Json<AggSendStep2Request>,
++) -> Result<impl Responder, Error> {
++    let mpc_store = app_state.get_mpc_store(req.node_id)?;
++    let session = mpc_store.get_session(req.session_id).await?;
++    let key = mpc_store.get_key(&session.end_user_pubkey, req.node_id).await?;
++    let keypair = Keypair::from_bytes(&bs58::decode(key.private_key).into_vec().unwrap()).unwrap();
++
++    let (agg_message_2, secret_state_2) = tss::step_one(keypair);
++
++    let keys_from_db = mpc_store.get_keys_for_user(&session.end_user_pubkey).await?;
++    let pubkeys: Vec<Pubkey> = keys_from_db
++        .iter()
++        .map(|k| Pubkey::from_str(&k.public_key).unwrap())
++        .collect();
++    
++    let rpc_client = &app_state.rpc_client;
++    let recent_blockhash = rpc_client.get_latest_blockhash()?;
++
++    let message = if let Some(tx_str) = session.transaction {
++        let tx: Transaction = serde_json::from_str(&tx_str).unwrap();
++        tx.message_data()
++    } else {
++        // Create SOL transfer message
++        let to_pubkey = Pubkey::from_str(&session.to_address).unwrap();
++        let from_pubkey = Pubkey::from_str(&keys_from_db.iter().find(|k| k.node_id == req.node_id).unwrap().public_key).unwrap();
++        let ix = system_instruction::transfer(&from_pubkey, &to_pubkey, (session.amount * 1e9) as u64);
++        let mut msg = Message::new(&[ix], Some(&from_pubkey));
++        msg.recent_blockhash = recent_blockhash;
++        msg.serialize()
++    };
++    
++    let partial_signature = tss::step_two(
++        keypair,
++        &message,
++        pubkeys,
++        vec![req.agg_message_1.clone()],
++        secret_state_2.clone(),
++    ).unwrap();
++
++    mpc_store
++        .update_session_with_step2_data(
++            req.session_id,
++            &secret_state_2,
++            &bs58::encode(partial_signature.0.as_ref()).into_string(),
++            &serde_json::to_string(&agg_message_2).unwrap(),
++        )
++        .await?;
++
++    Ok(Json(AggSendStep2Response { partial_signature, agg_message_2 }))
++}
++
++
++async fn aggregate_signatures_broadcast(
++    app_state: web::Data<AppState>,
++    req: Json<AggregateSignaturesRequest>,
++) -> Result<impl Responder, Error> {
++    let mpc_store_1 = app_state.get_mpc_store(1)?;
++    let session = mpc_store_1.get_session(req.session_id).await?;
++    let keys_from_db = mpc_store_1.get_keys_for_user(&session.end_user_pubkey).await?;
++    let key1 = &keys_from_db[0];
++    let keypair1 = Keypair::from_bytes(&bs58::decode(&key1.private_key).into_vec().unwrap()).unwrap();
++    
++    let pubkeys: Vec<Pubkey> = keys_from_db
++        .iter()
++        .map(|k| Pubkey::from_str(&k.public_key).unwrap())
++        .collect();
++
++    let rpc_client = &app_state.rpc_client;
++    let recent_blockhash = rpc_client.get_latest_blockhash()?;
++    
++    let secret_state_1: SecretAggStepOne = serde_json::from_slice(&session.secret_state_1.unwrap()).unwrap();
++
++    let tx = if let Some(tx_str) = session.transaction {
++        serde_json::from_str(&tx_str).unwrap()
++    } else {
++        let agg_pubkey = tss::key_agg(pubkeys.clone(), None).unwrap().agg_public_key;
++        let agg_pubkey = Pubkey::new_from_array(agg_pubkey.to_bytes(true));
++        let to_pubkey = Pubkey::from_str(&session.to_address).unwrap();
++        let ix = system_instruction::transfer(&agg_pubkey, &to_pubkey, (session.amount * 1e9) as u64);
++        let mut message = Message::new(&[ix], Some(&agg_pubkey));
++        message.recent_blockhash = recent_blockhash;
++        Transaction::new_unsigned(message)
++    };
++
++    let partial_signature_1 = tss::step_two(
++        keypair1,
++        &tx.message_data(),
++        pubkeys.clone(),
++        vec![req.agg_message_2.clone()],
++        secret_state_1,
++    ).unwrap();
++
++    let final_tx = tss::sign_and_broadcast_transaction(
++        tx,
++        pubkeys,
++        vec![partial_signature_1, req.partial_signature_2],
++    ).unwrap();
++
++    let tx_sig = rpc_client.send_and_confirm_transaction(&final_tx)?;
++
++    Ok(Json(AggregateSignaturesResponse { transaction_signature: tx_sig.to_string() }))
++}
++
++async fn send_single() -> Result<HttpResponse, Error> {
++    // Implementation can be added here for testing
++    Ok(HttpResponse::Ok().body("Not Implemented"))
++}
++
++#[actix_web::main]
++async fn main() -> std::io::Result<()> {
++    dotenv().ok();
++    env_logger::init();
++
++    let mpc_database_url_1 = std::env::var("MPC_DATABASE_URL_1").expect("MPC_DATABASE_URL_1 must be set");
++    let mpc_database_url_2 = std::env::var("MPC_DATABASE_URL_2").expect("MPC_DATABASE_URL_2 must be set");
++    let main_database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
++    let rpc_url = std::env::var("SOLANA_RPC_URL").expect("SOLANA_RPC_URL must be set");
++
++    let mpc_pool_1 = sqlx::PgPool::connect(&mpc_database_url_1).await.unwrap();
++    let mpc_pool_2 = sqlx::PgPool::connect(&mpc_database_url_2).await.unwrap();
++    let main_pool = sqlx::PgPool::connect(&main_database_url).await.unwrap();
++
++    let app_state = web::Data::new(AppState {
++        mpc_store_1: MpcStore::new(mpc_pool_1),
++        mpc_store_2: MpcStore::new(mpc_pool_2),
++        main_store: Arc::new(Store::new(main_pool)),
++        rpc_client: RpcClient::new(rpc_url),
++    });
++
++    HttpServer::new(move || {
++        App::new()
++            .app_data(app_state.clone())
++            .route("/generate", post().to(generate))
++            .route("/send-single", post().to(send_single))
++            .route("/aggregate-keys", post().to(aggregate_keys))
++            .route("/agg-send-step1", post().to(agg_send_step1))
++            .route("/agg-send-step2", post().to(agg_send_step2))
++            .route(
++                "/aggregate-signatures-broadcast",
++                post().to(aggregate_signatures_broadcast),
++            )
++    })
++    .bind("127.0.0.1:8081")? // Running on a different port
++    .run()
++    .await
+ }
+\ No newline at end of file
+diff --git a/mpc/src/serialization.rs b/mpc/src/serialization.rs
+index 336a908..a17155b 100644
+--- a/mpc/src/serialization.rs
++++ b/mpc/src/serialization.rs
+@@ -1,57 +1,26 @@
+-use std::fmt::{Display, Formatter};
++use multi_party_eddsa::protocols::musig2::{PrivatePartialNonces, PublicPartialNonces};
++use serde::{Deserialize, Serialize};
++use solana_sdk::{pubkey::Pubkey, signature::Signature};
+ 
+-use bs58::decode::Error as Bs58Error;
+-use solana_client::client_error::ClientError;
+-
+-use crate::serialization::Error as DeserializationError;
+-
+-#[derive(Debug)]
+-pub enum Error {
+-    WrongNetwork(String),
+-    BadBase58(Bs58Error),
+-    WrongKeyPair(ed25519_dalek::SignatureError),
+-    AirdropFailed(ClientError),
+-    RecentHashFailed(ClientError),
+-    ConfirmingTransactionFailed(ClientError),
+-    BalaceFailed(ClientError),
+-    SendTransactionFailed(ClientError),
+-    DeserializationFailed { error: DeserializationError, field_name: &'static str },
+-    MismatchMessages,
+-    InvalidSignature,
+-    KeyPairIsNotInKeys,
++#[derive(Serialize, Deserialize, Debug, Clone)]
++pub struct AggMessage1 {
++    pub sender: Pubkey,
++    pub public_nonces: PublicPartialNonces,
+ }
+ 
+-impl Display for Error {
+-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+-        match self {
+-            Self::WrongNetwork(net) => write!(f, "Unrecognized network: {}, please select Mainnet/Testnet/Devnet", net),
+-            Self::BadBase58(e) => write!(f, "Based58 Error: {}", e),
+-            Self::WrongKeyPair(e) => write!(f, "Failed deserializing keypair: {}", e),
+-            Self::AirdropFailed(e) => write!(f, "Failed asking for an airdrop: {}", e),
+-            Self::RecentHashFailed(e) => write!(f, "Failed recieving the latest hash: {}", e),
+-            Self::ConfirmingTransactionFailed(e) => write!(f, "Failed confirming transaction: {}", e),
+-            Self::BalaceFailed(e) => write!(f, "Failed checking balance: {}", e),
+-            Self::SendTransactionFailed(e) => write!(f, "Failed sending transaction: {}", e),
+-            Self::DeserializationFailed { error, field_name } => {
+-                write!(f, "Failed deserializing {}: {}", field_name, error)
+-            }
+-            Self::MismatchMessages => write!(f, "There is a mismatch between first_messages and second_messages"),
+-            Self::InvalidSignature => write!(f, "The resulting signature doesn't match the transaction"),
+-            Self::KeyPairIsNotInKeys => write!(f, "The provided keypair is not in the list of pubkeys"),
+-        }
+-    }
++#[derive(Serialize, Deserialize, Clone)]
++pub struct SecretAggStepOne {
++    pub private_nonces: PrivatePartialNonces,
++    pub public_nonces: PublicPartialNonces,
+ }
+ 
+-impl From<Bs58Error> for Error {
+-    fn from(e: Bs58Error) -> Self {
+-        Self::BadBase58(e)
+-    }
+-}
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq, PartialEq)]
++pub struct PartialSignature(pub Signature);
+ 
+-impl From<ed25519_dalek::SignatureError> for Error {
+-    fn from(e: ed25519_dalek::SignatureError) -> Self {
+-        Self::WrongKeyPair(e)
+-    }
+-}
+-
+-impl std::error::Error for Error {}
+\ No newline at end of file
++#[derive(Debug, thiserror::Error)]
++pub enum Error {
++    #[error("invalid point: {0}")]
++    InvalidPoint(curv::elliptic::curves::NotOnCurve),
++    #[error("invalid scalar: {0}")]
++    InvalidScalar(curv::elliptic::curves::WrongOrder),
++}
+\ No newline at end of file
+diff --git a/mpc/src/tss.rs b/mpc/src/tss.rs
+index 0503fb3..635eb73 100644
+--- a/mpc/src/tss.rs
++++ b/mpc/src/tss.rs
+@@ -4,10 +4,10 @@ use curv::elliptic::curves::{Ed25519, Point, Scalar};
+ use multi_party_eddsa::protocols::musig2::{self, PrivatePartialNonces, PublicPartialNonces};
+ use multi_party_eddsa::protocols::ExpandedKeyPair;
+ use solana_sdk::signature::{Keypair, Signature, Signer, SignerError};
+-use solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::Transaction};
++use solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::Transaction, message::Message, system_instruction};
+ 
+ use crate::serialization::{AggMessage1, Error as DeserializationError, PartialSignature, SecretAggStepOne};
+-use crate::{create_unsigned_transaction, Error};
++use crate::error::Error;
+ 
+ /// Create the aggregate public key, pass key=None if you don't care about the coefficient
+ pub fn key_agg(keys: Vec<Pubkey>, key: Option<Pubkey>) -> Result<musig2::PublicKeyAgg, Error> {
+@@ -37,10 +37,7 @@ pub fn step_one(keypair: Keypair) -> (AggMessage1, SecretAggStepOne) {
+ #[allow(clippy::too_many_arguments)]
+ pub fn step_two(
+     keypair: Keypair,
+-    amount: f64,
+-    to: Pubkey,
+-    memo: Option<String>,
+-    recent_block_hash: Hash,
++    message_to_sign: &[u8],
+     keys: Vec<Pubkey>,
+     first_messages: Vec<AggMessage1>,
+     secret_state: SecretAggStepOne,
+@@ -49,12 +46,8 @@ pub fn step_two(
+ 
+     // Generate the aggregate key together with the coefficient of the current keypair
+     let aggkey = key_agg(keys, Some(keypair.pubkey()))?;
+-    let aggpubkey = Pubkey::new(&*aggkey.agg_public_key.to_bytes(true));
+     let extended_kepair = ExpandedKeyPair::create_from_private_key(keypair.secret().to_bytes());
+ 
+-    // Create the unsigned transaction
+-    let mut tx = create_unsigned_transaction(amount, &to, memo, &aggpubkey);
+-
+     let signer = PartialSigner {
+         signer_private_nonce: secret_state.private_nonces,
+         signer_public_nonce: secret_state.public_nonces,
+@@ -62,17 +55,13 @@ pub fn step_two(
+         extended_kepair,
+         aggregated_pubkey: aggkey,
+     };
+-    // Sign the transaction using a custom `PartialSigner`, this is required to comply with Solana's API.
+-    tx.sign(&[&signer], recent_block_hash);
+-    let sig = tx.signatures[0];
++
++    let sig = signer.try_sign_message(message_to_sign).unwrap();
+     Ok(PartialSignature(sig))
+ }
+ 
+-pub fn sign_and_broadcast(
+-    amount: f64,
+-    to: Pubkey,
+-    memo: Option<String>,
+-    recent_block_hash: Hash,
++pub fn sign_and_broadcast_transaction(
++    mut transaction: Transaction,
+     keys: Vec<Pubkey>,
+     signatures: Vec<PartialSignature>,
+ ) -> Result<Transaction, Error> {
+@@ -112,18 +101,14 @@ pub fn sign_and_broadcast(
+     sig_bytes[32..].copy_from_slice(&full_sig.s.to_bytes());
+     let sig = Signature::new(&sig_bytes);
+ 
+-    // Create the same transaction again
+-    let mut tx = create_unsigned_transaction(amount, &to, memo, &aggpubkey);
+-    // Insert the recent_block_hash and the signature to the right places
+-    tx.message.recent_blockhash = recent_block_hash;
+-    assert_eq!(tx.signatures.len(), 1);
+-    tx.signatures[0] = sig;
++    // Insert the signature to the right place
++    transaction.signatures[0] = sig;
+ 
+     // Make sure the resulting transaction is actually valid.
+-    if tx.verify().is_err() {
++    if transaction.verify().is_err() {
+         return Err(Error::InvalidSignature);
+     }
+-    Ok(tx)
++    Ok(transaction)
+ }
+ 
+ struct PartialSigner {
+@@ -163,11 +148,13 @@ impl Signer for PartialSigner {
+ mod tests {
+     use crate::native_token::lamports_to_sol;
+     use crate::serialization::Serialize;
+-    use crate::tss::{key_agg, sign_and_broadcast, step_one, step_two};
++    use crate::tss::{key_agg, sign_and_broadcast_transaction, step_one, step_two};
+     use solana_sdk::pubkey::Pubkey;
+     use solana_sdk::signature::{Keypair, Signer};
+     use solana_streamer::socket::SocketAddrSpace;
+     use solana_test_validator::TestValidator;
++    use solana_sdk::transaction::Transaction;
++    use solana_sdk::{message::Message, system_instruction};
+ 
+     fn clone_keypair(k: &Keypair) -> Keypair {
+         Keypair::from_bytes(&k.to_bytes()).unwrap()
+@@ -200,6 +187,13 @@ mod tests {
+         let amount = lamports_to_sol(full_amount / 2);
+         let memo = Some("test_roundtrip".to_string());
+ 
++        let ix = system_instruction::transfer(&aggpubkey_solana, &to.pubkey(), (amount * 1e9) as u64);
++        let mut message = Message::new(&[ix], Some(&aggpubkey_solana));
++        if let Some(memo) = memo.clone() {
++            message.instructions.push(spl_memo::build_memo(memo.as_bytes(), &[]));
++        }
++        message.recent_blockhash = recent_block_hash;
++
+         let partial_sigs: Vec<_> = keys
+             .iter()
+             .map(clone_keypair)
+@@ -208,12 +202,13 @@ mod tests {
+             .map(|(i, (key, secret))| {
+                 let mut first_msgs: Vec<_> = first_msgs.iter().map(clone_serialize).collect();
+                 first_msgs.remove(i);
+-                step_two(key, amount, to.pubkey(), memo.clone(), recent_block_hash, pubkeys.clone(), first_msgs, secret)
++                step_two(key, &message.serialize(), pubkeys.clone(), first_msgs, secret)
+                     .unwrap()
+             })
+             .collect();
+ 
+-        let full_tx = sign_and_broadcast(amount, to.pubkey(), memo, recent_block_hash, pubkeys, partial_sigs).unwrap();
++        let mut tx = Transaction::new_unsigned(message);
++        let full_tx = sign_and_broadcast_transaction(tx, pubkeys, partial_sigs).unwrap();
+         let sig = rpc_client.send_transaction(&full_tx).unwrap();
+ 
+         // Wait for confirmation
+diff --git a/store/.gitignore b/store/.gitignore
+index ea8c4bf..0b745e2 100644
+--- a/store/.gitignore
++++ b/store/.gitignore
+@@ -1 +1,2 @@
+ /target
++.env
+\ No newline at end of file
+diff --git a/store/Cargo.toml b/store/Cargo.toml
+index 2ad0aee..8759c53 100644
+--- a/store/Cargo.toml
++++ b/store/Cargo.toml
+@@ -4,8 +4,10 @@ version = "0.1.0"
+ edition = "2024"
+ 
+ [dependencies]
+-uuid = { version = "1.0", features = ["v4"] }
++uuid = { version = "1.0", features = ["v4", "serde"] }
+ chrono = { version = "0.4", features = ["serde"] }
+-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+-bcrypt = "0.15"
++sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "offline"] }
++bcrypt = "0.17.1"
+ tokio = { version = "1.0", features = ["full"] }
++serde = { version = "1.0", features = ["derive"] }
++serde_json = "1.0"
+diff --git a/store/src/lib.rs b/store/src/lib.rs
+index e291994..7db198c 100644
+--- a/store/src/lib.rs
++++ b/store/src/lib.rs
+@@ -1,4 +1,7 @@
++pub mod models;
+ pub mod user;
++pub mod solana;
++pub mod public_key;
+ 
+ use sqlx::PgPool;
+ 
+diff --git a/store/src/models/asset.rs b/store/src/models/asset.rs
+new file mode 100644
+index 0000000..968dc30
+--- /dev/null
++++ b/store/src/models/asset.rs
+@@ -0,0 +1,16 @@
++use chrono::{DateTime, Utc};
++use serde::{Deserialize, Serialize};
++use sqlx::FromRow;
++use uuid::Uuid;
++
++#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
++pub struct Asset {
++    pub id: Uuid,
++    pub mint_address: String,
++    pub decimals: i32,
++    pub name: String,
++    pub symbol: String,
++    pub logo_url: Option<String>,
++    pub created_at: DateTime<Utc>,
++    pub updated_at: DateTime<Utc>,
++}
+diff --git a/store/src/models/balance.rs b/store/src/models/balance.rs
+new file mode 100644
+index 0000000..10544a1
+--- /dev/null
++++ b/store/src/models/balance.rs
+@@ -0,0 +1,14 @@
++use chrono::{DateTime, Utc};
++use serde::{Deserialize, Serialize};
++use sqlx::FromRow;
++use uuid::Uuid;
++
++#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
++pub struct Balance {
++    pub id: Uuid,
++    pub amount: i64,
++    pub created_at: DateTime<Utc>,
++    pub updated_at: DateTime<Utc>,
++    pub user_id: Uuid,
++    pub asset_id: Uuid,
++}
+diff --git a/store/src/models/mod.rs b/store/src/models/mod.rs
+new file mode 100644
+index 0000000..785c2d2
+--- /dev/null
++++ b/store/src/models/mod.rs
+@@ -0,0 +1,5 @@
++pub mod user;
++pub mod asset;
++pub mod balance;
++pub mod quote;
++pub mod public_key;
+diff --git a/store/src/models/public_key.rs b/store/src/models/public_key.rs
+new file mode 100644
+index 0000000..fb025e7
+--- /dev/null
++++ b/store/src/models/public_key.rs
+@@ -0,0 +1,10 @@
++use chrono::{DateTime, Utc};
++use sqlx::FromRow;
++
++#[derive(Debug, Clone, FromRow)]
++pub struct PublicKey {
++    pub end_user_pubkey: String,
++    pub is_active: bool,
++    pub created_at: DateTime<Utc>,
++}
++
+diff --git a/store/src/models/quote.rs b/store/src/models/quote.rs
+new file mode 100644
+index 0000000..df2cf3d
+--- /dev/null
++++ b/store/src/models/quote.rs
+@@ -0,0 +1,13 @@
++use chrono::{DateTime, Utc};
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
++use sqlx::FromRow;
++use uuid::Uuid;
++
++#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
++pub struct Quote {
++    pub id: Uuid,
++    pub user_id: Uuid,
++    pub quote_response: Value,
++    pub created_at: DateTime<Utc>,
++}
+diff --git a/store/src/models/user.rs b/store/src/models/user.rs
+new file mode 100644
+index 0000000..86bb7dd
+--- /dev/null
++++ b/store/src/models/user.rs
+@@ -0,0 +1,14 @@
++use chrono::{DateTime, Utc};
++use serde::{Deserialize, Serialize};
++use sqlx::FromRow;
++use uuid::Uuid;
++
++#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
++pub struct User {
++    pub id: Uuid,
++    pub email: String,
++    pub password_hash: String,
++    pub public_key: String,
++    pub created_at: DateTime<Utc>,
++    pub updated_at: DateTime<Utc>,
++}
+diff --git a/store/src/public_key.rs b/store/src/public_key.rs
+new file mode 100644
+index 0000000..bcb1a27
+--- /dev/null
++++ b/store/src/public_key.rs
+@@ -0,0 +1,50 @@
++use crate::models::public_key::PublicKey;
++use crate::Store;
++
++#[derive(Debug)]
++pub enum PublicKeyError {
++    DatabaseError(String),
++}
++
++impl std::fmt::Display for PublicKeyError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            PublicKeyError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
++        }
++    }
++}
++
++impl std::error::Error for PublicKeyError {}
++
++impl Store {
++    pub async fn add_public_key(&self, pubkey: &str) -> Result<PublicKey, PublicKeyError> {
++        let key = sqlx::query_as!(
++            PublicKey,
++            r#"
++            INSERT INTO public_keys (end_user_pubkey, is_active)
++            VALUES ($1, true)
++            ON CONFLICT (end_user_pubkey) DO UPDATE SET is_active = true
++            RETURNING end_user_pubkey, is_active, created_at
++            "#,
++            pubkey
++        )
++        .fetch_one(&self.pool)
++        .await
++        .map_err(|e| PublicKeyError::DatabaseError(e.to_string()))?;
++        Ok(key)
++    }
++
++    pub async fn get_all_public_keys(&self) -> Result<Vec<PublicKey>, PublicKeyError> {
++        let keys = sqlx::query_as!(
++            PublicKey,
++            r#"
++            SELECT end_user_pubkey, is_active, created_at FROM public_keys
++            "#
++        )
++        .fetch_all(&self.pool)
++        .await
++        .map_err(|e| PublicKeyError::DatabaseError(e.to_string()))?;
++        Ok(keys)
++    }
++}
++
+diff --git a/store/src/solana.rs b/store/src/solana.rs
+new file mode 100644
+index 0000000..a3fc510
+--- /dev/null
++++ b/store/src/solana.rs
+@@ -0,0 +1,172 @@
++use crate::models::asset::Asset;
++use crate::models::balance::Balance;
++use crate::models::quote::Quote;
++use crate::Store;
++use serde_json::Value;
++use uuid::Uuid;
++
++#[derive(Debug)]
++pub enum QuoteError {
++    DatabaseError(String),
++}
++
++impl std::fmt::Display for QuoteError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            QuoteError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
++        }
++    }
++}
++
++impl std::error::Error for QuoteError {}
++
++impl Store {
++    pub async fn create_quote(
++        &self,
++        user_id: Uuid,
++        quote_response: Value,
++    ) -> Result<Quote, QuoteError> {
++        let quote = sqlx::query_as!(
++            Quote,
++            r#"
++            INSERT INTO quotes (user_id, quote_response)
++            VALUES ($1, $2)
++            RETURNING id, user_id, quote_response, created_at
++            "#,
++            user_id,
++            quote_response
++        )
++        .fetch_one(&self.pool)
++        .await
++        .map_err(|e| QuoteError::DatabaseError(e.to_string()))?;
++
++        Ok(quote)
++    }
++
++    pub async fn get_quote(&self, quote_id: Uuid) -> Result<Option<Quote>, QuoteError> {
++        let quote = sqlx::query_as!(
++            Quote,
++            r#"
++            SELECT id, user_id, quote_response, created_at
++            FROM quotes
++            WHERE id = $1
++            "#,
++            quote_id
++        )
++        .fetch_optional(&self.pool)
++        .await
++        .map_err(|e| QuoteError::DatabaseError(e.to_string()))?;
++
++        Ok(quote)
++    }
++
++    pub async fn get_sol_balance(&self, user_id: Uuid) -> Result<Option<Balance>, QuoteError> {
++        let sol_mint_address = "So11111111111111111111111111111111111111112";
++        let balance = sqlx::query_as!(
++            Balance,
++            r#"
++            SELECT b.*
++            FROM balances b
++            JOIN assets a ON b.asset_id = a.id
++            WHERE b.user_id = $1 AND a.mint_address = $2
++            "#,
++            user_id,
++            sol_mint_address
++        )
++        .fetch_optional(&self.pool)
++        .await
++        .map_err(|e| QuoteError::DatabaseError(e.to_string()))?;
++
++        Ok(balance)
++    }
++
++    pub async fn get_token_balances(
++        &self,
++        user_id: Uuid,
++    ) -> Result<Vec<(Balance, Asset)>, QuoteError> {
++        let balances = sqlx::query_as!(
++            Balance,
++            r#"
++            SELECT b.*
++            FROM balances b
++            "#,
++        )
++        .fetch_all(&self.pool)
++        .await
++        .map_err(|e| QuoteError::DatabaseError(e.to_string()))?;
++        
++        let assets = sqlx::query_as!(
++            Asset,
++            r#"
++            SELECT a.*
++            FROM assets a
++            "#,
++        )
++        .fetch_all(&self.pool)
++        .await
++        .map_err(|e| QuoteError::DatabaseError(e.to_string()))?;
++
++        let mut result = Vec::new();
++        for balance in balances {
++            if balance.user_id == user_id {
++                for asset in &assets {
++                    if balance.asset_id == asset.id {
++                        result.push((balance.clone(), asset.clone()));
++                    }
++                }
++            }
++        }
++
++        Ok(result)
++    }
++
++    pub async fn upsert_asset(
++        &self,
++        mint_address: &str,
++        decimals: i32,
++        name: &str,
++        symbol: &str,
++    ) -> Result<Asset, QuoteError> {
++        let asset = sqlx::query_as!(
++            Asset,
++            r#"
++            INSERT INTO assets (mint_address, decimals, name, symbol)
++            VALUES ($1, $2, $3, $4)
++            ON CONFLICT (mint_address) DO UPDATE SET name = $3, symbol = $4
++            RETURNING id, mint_address, decimals, name, symbol, logo_url, created_at, updated_at
++            "#,
++            mint_address,
++            decimals,
++            name,
++            symbol
++        )
++        .fetch_one(&self.pool)
++        .await
++        .map_err(|e| QuoteError::DatabaseError(e.to_string()))?;
++        Ok(asset)
++    }
++
++    pub async fn upsert_balance(
++        &self,
++        user_id: Uuid,
++        asset_id: Uuid,
++        amount: i64,
++    ) -> Result<Balance, QuoteError> {
++        let balance = sqlx::query_as!(
++            Balance,
++            r#"
++            INSERT INTO balances (user_id, asset_id, amount)
++            VALUES ($1, $2, $3)
++            ON CONFLICT (user_id, asset_id) DO UPDATE SET amount = $3, updated_at = NOW()
++            RETURNING id, amount, created_at, updated_at, user_id, asset_id
++            "#,
++            user_id,
++            asset_id,
++            amount
++        )
++        .fetch_one(&self.pool)
++        .await
++        .map_err(|e| QuoteError::DatabaseError(e.to_string()))?;
++        Ok(balance)
++    }
++}
+diff --git a/store/src/user.rs b/store/src/user.rs
+index 30b1f27..3c95d22 100644
+--- a/store/src/user.rs
++++ b/store/src/user.rs
+@@ -1,18 +1,13 @@
++use crate::models::user::User;
+ use crate::Store;
+ use uuid::Uuid;
+-use chrono::{DateTime, Utc};
+-
+-#[derive(Debug, Clone)]
+-pub struct User {
+-    pub id: String,
+-    pub email: String,
+-    pub created_at: String,
+-}
++use bcrypt::{hash, DEFAULT_COST};
+ 
+ #[derive(Debug)]
+ pub struct CreateUserRequest {
+     pub email: String,
+     pub password: String,
++    pub public_key: String,
+ }
+ 
+ #[derive(Debug)]
+@@ -20,6 +15,7 @@ pub enum UserError {
+     UserExists,
+     InvalidInput(String),
+     DatabaseError(String),
++    PasswordHashingError(String),
+ }
+ 
+ impl std::fmt::Display for UserError {
+@@ -28,6 +24,7 @@ impl std::fmt::Display for UserError {
+             UserError::UserExists => write!(f, "User already exists"),
+             UserError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
+             UserError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
++            UserError::PasswordHashingError(msg) => write!(f, "Password hashing error: {}", msg),
+         }
+     }
+ }
+@@ -36,55 +33,90 @@ impl std::error::Error for UserError {}
+ 
+ impl Store {
+     pub async fn create_user(&self, request: CreateUserRequest) -> Result<User, UserError> {
+-        // Validate email format
+         if !request.email.contains('@') {
+             return Err(UserError::InvalidInput("Invalid email format".to_string()));
+         }
+ 
+-        // Validate password length
+         if request.password.len() < 6 {
+-            return Err(UserError::InvalidInput("Password must be at least 6 characters".to_string()));
++            return Err(UserError::InvalidInput(
++                "Password must be at least 6 characters".to_string(),
++            ));
+         }
+ 
+-        // Check if user already exists
+-        let existing_user = sqlx::query!(
+-            "SELECT id FROM users WHERE email = $1",
+-            request.email
+-        )
+-        .fetch_optional(&self.pool)
+-        .await
+-        .map_err(|e| UserError::DatabaseError(e.to_string()))?;
++        let existing_user = self.get_user_by_email(&request.email).await?;
+ 
+         if existing_user.is_some() {
+             return Err(UserError::UserExists);
+         }
+ 
+-        // Hash the password
+-        let password_hash = bcrypt::hash(&request.password, bcrypt::DEFAULT_COST)
+-            .map_err(|e| UserError::DatabaseError(format!("Password hashing failed: {}", e)))?;
+-
+-        // Generate user ID and timestamp
+-        let user_id = Uuid::new_v4().to_string();
+-        let created_at = Utc::now();
++        let password_hash = hash(&request.password, DEFAULT_COST)
++            .map_err(|e| UserError::PasswordHashingError(e.to_string()))?;
+ 
+-        // Insert user into database
+-        sqlx::query!(
+-            "INSERT INTO users (id, email, password_hash, created_at) VALUES ($1, $2, $3, $4)",
+-            user_id,
++        let user = sqlx::query_as!(
++            User,
++            r#"
++            INSERT INTO users (email, password_hash, public_key)
++            VALUES ($1, $2, $3)
++            RETURNING id, email, password_hash, public_key, created_at, updated_at
++            "#,
+             request.email,
+             password_hash,
+-            created_at
++            request.public_key
+         )
+-        .execute(&self.pool)
++        .fetch_one(&self.pool)
++        .await
++        .map_err(|e| UserError::DatabaseError(e.to_string()))?;
++
++        Ok(user)
++    }
++
++    pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>, UserError> {
++        let user = sqlx::query_as!(
++            User,
++            r#"
++            SELECT id, email, password_hash, public_key, created_at, updated_at
++            FROM users
++            WHERE email = $1
++            "#,
++            email
++        )
++        .fetch_optional(&self.pool)
+         .await
+         .map_err(|e| UserError::DatabaseError(e.to_string()))?;
+ 
+-        // Return the created user
+-        let user = User {
+-            id: user_id,
+-            email: request.email,
+-            created_at: created_at.to_rfc3339(),
+-        };
++        Ok(user)
++    }
++
++    pub async fn get_user_by_id(&self, user_id: Uuid) -> Result<Option<User>, UserError> {
++        let user = sqlx::query_as!(
++            User,
++            r#"
++            SELECT id, email, password_hash, public_key, created_at, updated_at
++            FROM users
++            WHERE id = $1
++            "#,
++            user_id
++        )
++        .fetch_optional(&self.pool)
++        .await
++        .map_err(|e| UserError::DatabaseError(e.to_string()))?;
++
++        Ok(user)
++    }
++
++    pub async fn get_user_by_public_key(&self, public_key: &str) -> Result<Option<User>, UserError> {
++        let user = sqlx::query_as!(
++            User,
++            r#"
++            SELECT id, email, password_hash, public_key, created_at, updated_at
++            FROM users
++            WHERE public_key = $1
++            "#,
++            public_key
++        )
++        .fetch_optional(&self.pool)
++        .await
++        .map_err(|e| UserError::DatabaseError(e.to_string()))?;
+ 
+         Ok(user)
+     }

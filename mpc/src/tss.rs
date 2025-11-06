@@ -4,10 +4,10 @@ use curv::elliptic::curves::{Ed25519, Point, Scalar};
 use multi_party_eddsa::protocols::musig2::{self, PrivatePartialNonces, PublicPartialNonces};
 use multi_party_eddsa::protocols::ExpandedKeyPair;
 use solana_sdk::signature::{Keypair, Signature, Signer, SignerError};
-use solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::Transaction};
+use solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::Transaction, message::Message, system_instruction};
 
 use crate::serialization::{AggMessage1, Error as DeserializationError, PartialSignature, SecretAggStepOne};
-use crate::{create_unsigned_transaction, Error};
+use crate::error::Error;
 
 /// Create the aggregate public key, pass key=None if you don't care about the coefficient
 pub fn key_agg(keys: Vec<Pubkey>, key: Option<Pubkey>) -> Result<musig2::PublicKeyAgg, Error> {
@@ -37,10 +37,7 @@ pub fn step_one(keypair: Keypair) -> (AggMessage1, SecretAggStepOne) {
 #[allow(clippy::too_many_arguments)]
 pub fn step_two(
     keypair: Keypair,
-    amount: f64,
-    to: Pubkey,
-    memo: Option<String>,
-    recent_block_hash: Hash,
+    message_to_sign: &[u8],
     keys: Vec<Pubkey>,
     first_messages: Vec<AggMessage1>,
     secret_state: SecretAggStepOne,
@@ -49,11 +46,7 @@ pub fn step_two(
 
     // Generate the aggregate key together with the coefficient of the current keypair
     let aggkey = key_agg(keys, Some(keypair.pubkey()))?;
-    let aggpubkey = Pubkey::new(&*aggkey.agg_public_key.to_bytes(true));
     let extended_kepair = ExpandedKeyPair::create_from_private_key(keypair.secret().to_bytes());
-
-    // Create the unsigned transaction
-    let mut tx = create_unsigned_transaction(amount, &to, memo, &aggpubkey);
 
     let signer = PartialSigner {
         signer_private_nonce: secret_state.private_nonces,
@@ -62,17 +55,13 @@ pub fn step_two(
         extended_kepair,
         aggregated_pubkey: aggkey,
     };
-    // Sign the transaction using a custom `PartialSigner`, this is required to comply with Solana's API.
-    tx.sign(&[&signer], recent_block_hash);
-    let sig = tx.signatures[0];
+
+    let sig = signer.try_sign_message(message_to_sign).unwrap();
     Ok(PartialSignature(sig))
 }
 
-pub fn sign_and_broadcast(
-    amount: f64,
-    to: Pubkey,
-    memo: Option<String>,
-    recent_block_hash: Hash,
+pub fn sign_and_broadcast_transaction(
+    mut transaction: Transaction,
     keys: Vec<Pubkey>,
     signatures: Vec<PartialSignature>,
 ) -> Result<Transaction, Error> {
@@ -112,18 +101,14 @@ pub fn sign_and_broadcast(
     sig_bytes[32..].copy_from_slice(&full_sig.s.to_bytes());
     let sig = Signature::new(&sig_bytes);
 
-    // Create the same transaction again
-    let mut tx = create_unsigned_transaction(amount, &to, memo, &aggpubkey);
-    // Insert the recent_block_hash and the signature to the right places
-    tx.message.recent_blockhash = recent_block_hash;
-    assert_eq!(tx.signatures.len(), 1);
-    tx.signatures[0] = sig;
+    // Insert the signature to the right place
+    transaction.signatures[0] = sig;
 
     // Make sure the resulting transaction is actually valid.
-    if tx.verify().is_err() {
+    if transaction.verify().is_err() {
         return Err(Error::InvalidSignature);
     }
-    Ok(tx)
+    Ok(transaction)
 }
 
 struct PartialSigner {
@@ -163,11 +148,13 @@ impl Signer for PartialSigner {
 mod tests {
     use crate::native_token::lamports_to_sol;
     use crate::serialization::Serialize;
-    use crate::tss::{key_agg, sign_and_broadcast, step_one, step_two};
+    use crate::tss::{key_agg, sign_and_broadcast_transaction, step_one, step_two};
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::{Keypair, Signer};
     use solana_streamer::socket::SocketAddrSpace;
     use solana_test_validator::TestValidator;
+    use solana_sdk::transaction::Transaction;
+    use solana_sdk::{message::Message, system_instruction};
 
     fn clone_keypair(k: &Keypair) -> Keypair {
         Keypair::from_bytes(&k.to_bytes()).unwrap()
@@ -200,6 +187,13 @@ mod tests {
         let amount = lamports_to_sol(full_amount / 2);
         let memo = Some("test_roundtrip".to_string());
 
+        let ix = system_instruction::transfer(&aggpubkey_solana, &to.pubkey(), (amount * 1e9) as u64);
+        let mut message = Message::new(&[ix], Some(&aggpubkey_solana));
+        if let Some(memo) = memo.clone() {
+            message.instructions.push(spl_memo::build_memo(memo.as_bytes(), &[]));
+        }
+        message.recent_blockhash = recent_block_hash;
+
         let partial_sigs: Vec<_> = keys
             .iter()
             .map(clone_keypair)
@@ -208,12 +202,13 @@ mod tests {
             .map(|(i, (key, secret))| {
                 let mut first_msgs: Vec<_> = first_msgs.iter().map(clone_serialize).collect();
                 first_msgs.remove(i);
-                step_two(key, amount, to.pubkey(), memo.clone(), recent_block_hash, pubkeys.clone(), first_msgs, secret)
+                step_two(key, &message.serialize(), pubkeys.clone(), first_msgs, secret)
                     .unwrap()
             })
             .collect();
 
-        let full_tx = sign_and_broadcast(amount, to.pubkey(), memo, recent_block_hash, pubkeys, partial_sigs).unwrap();
+        let mut tx = Transaction::new_unsigned(message);
+        let full_tx = sign_and_broadcast_transaction(tx, pubkeys, partial_sigs).unwrap();
         let sig = rpc_client.send_transaction(&full_tx).unwrap();
 
         // Wait for confirmation

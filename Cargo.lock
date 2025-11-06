@@ -478,13 +478,13 @@ checksum = "55248b47b0caf0546f7988906588779981c43bb1bc9d0c44087278f80cdb44ba"
 
 [[package]]
 name = "bcrypt"
-version = "0.15.1"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e65938ed058ef47d92cf8b346cc76ef48984572ade631927e9937b5ffc7662c7"
+checksum = "abaf6da45c74385272ddf00e1ac074c7d8a6c1a1dda376902bd6a427522a8b2c"
 dependencies = [
  "base64 0.22.1",
  "blowfish",
- "getrandom 0.2.16",
+ "getrandom 0.3.3",
  "subtle",
  "zeroize",
 ]
@@ -4611,6 +4611,8 @@ version = "0.1.0"
 dependencies = [
  "bcrypt",
  "chrono",
+ "serde",
+ "serde_json",
  "sqlx",
  "tokio",
  "uuid",
@@ -5097,6 +5099,7 @@ checksum = "2f87b8aa10b915a06587d0dec516c282ff295b475d94abf425d62b57710070a2"
 dependencies = [
  "getrandom 0.3.3",
  "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 

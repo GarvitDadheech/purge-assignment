@@ -21,6 +21,8 @@ use {
         GetSlotRequest, GetSlotResponse, GetVersionRequest, GetVersionResponse,
         IsBlockhashValidRequest, IsBlockhashValidResponse, PingRequest, PongResponse,
         SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest, SubscribeUpdate,
+        subscribe_request_filter_accounts_filter, SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
+        subscribe_request_filter_accounts_filter_memcmp,
     },
 };
 
@@ -203,6 +205,60 @@ impl<F: Interceptor> GeyserGrpcClient<F> {
         let request = tonic::Request::new(GetVersionRequest {});
         let response = self.geyser.get_version(request).await?;
         Ok(response.into_inner())
+    }
+
+    pub async fn subscribe_to_addresses(
+        &mut self,
+        addresses: Vec<String>,
+    ) -> GeyserGrpcClientResult<(
+        impl Sink<SubscribeRequest, Error = mpsc::SendError>,
+        impl Stream<Item = Result<SubscribeUpdate, Status>>,
+    )> {
+        let mut accounts_filter = std::collections::HashMap::new();
+
+        // Subscribe to all monitored addresses for lamport changes
+        for (i, address) in addresses.iter().enumerate() {
+            accounts_filter.insert(
+                format!("address_{}", i),
+                SubscribeRequestFilterAccounts {
+                    account: vec![address.clone()],
+                    owner: vec![],
+                    filters: vec![],
+                },
+            );
+        }
+
+        // Also subscribe to all SPL token accounts owned by our users
+        accounts_filter.insert(
+            "user_token_accounts".to_string(),
+            SubscribeRequestFilterAccounts {
+                account: vec![],
+                owner: vec!["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string()], // SPL Token Program
+                filters: addresses
+                    .iter()
+                    .map(|addr| SubscribeRequestFilterAccountsFilter {
+                        filter: Some(subscribe_request_filter_accounts_filter::Filter::Memcmp(
+                            SubscribeRequestFilterAccountsFilterMemcmp {
+                                offset: 32, // Owner field in token account
+                                data: Some(
+                                    subscribe_request_filter_accounts_filter_memcmp::Data::Base58(
+                                        addr.clone(),
+                                    ),
+                                ),
+                            },
+                        )),
+                    })
+                    .collect(),
+            },
+        );
+
+        let request = SubscribeRequest {
+            accounts: accounts_filter,
+            commitment: Some(CommitmentLevel::Confirmed as i32),
+            ..Default::default()
+        };
+
+        self.subscribe_with_request(Some(request)).await
     }
 }
 

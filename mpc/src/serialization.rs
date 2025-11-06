@@ -1,57 +1,26 @@
-use std::fmt::{Display, Formatter};
+use multi_party_eddsa::protocols::musig2::{PrivatePartialNonces, PublicPartialNonces};
+use serde::{Deserialize, Serialize};
+use solana_sdk::{pubkey::Pubkey, signature::Signature};
 
-use bs58::decode::Error as Bs58Error;
-use solana_client::client_error::ClientError;
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AggMessage1 {
+    pub sender: Pubkey,
+    pub public_nonces: PublicPartialNonces,
+}
 
-use crate::serialization::Error as DeserializationError;
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SecretAggStepOne {
+    pub private_nonces: PrivatePartialNonces,
+    pub public_nonces: PublicPartialNonces,
+}
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PartialSignature(pub Signature);
+
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
-    WrongNetwork(String),
-    BadBase58(Bs58Error),
-    WrongKeyPair(ed25519_dalek::SignatureError),
-    AirdropFailed(ClientError),
-    RecentHashFailed(ClientError),
-    ConfirmingTransactionFailed(ClientError),
-    BalaceFailed(ClientError),
-    SendTransactionFailed(ClientError),
-    DeserializationFailed { error: DeserializationError, field_name: &'static str },
-    MismatchMessages,
-    InvalidSignature,
-    KeyPairIsNotInKeys,
+    #[error("invalid point: {0}")]
+    InvalidPoint(curv::elliptic::curves::NotOnCurve),
+    #[error("invalid scalar: {0}")]
+    InvalidScalar(curv::elliptic::curves::WrongOrder),
 }
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WrongNetwork(net) => write!(f, "Unrecognized network: {}, please select Mainnet/Testnet/Devnet", net),
-            Self::BadBase58(e) => write!(f, "Based58 Error: {}", e),
-            Self::WrongKeyPair(e) => write!(f, "Failed deserializing keypair: {}", e),
-            Self::AirdropFailed(e) => write!(f, "Failed asking for an airdrop: {}", e),
-            Self::RecentHashFailed(e) => write!(f, "Failed recieving the latest hash: {}", e),
-            Self::ConfirmingTransactionFailed(e) => write!(f, "Failed confirming transaction: {}", e),
-            Self::BalaceFailed(e) => write!(f, "Failed checking balance: {}", e),
-            Self::SendTransactionFailed(e) => write!(f, "Failed sending transaction: {}", e),
-            Self::DeserializationFailed { error, field_name } => {
-                write!(f, "Failed deserializing {}: {}", field_name, error)
-            }
-            Self::MismatchMessages => write!(f, "There is a mismatch between first_messages and second_messages"),
-            Self::InvalidSignature => write!(f, "The resulting signature doesn't match the transaction"),
-            Self::KeyPairIsNotInKeys => write!(f, "The provided keypair is not in the list of pubkeys"),
-        }
-    }
-}
-
-impl From<Bs58Error> for Error {
-    fn from(e: Bs58Error) -> Self {
-        Self::BadBase58(e)
-    }
-}
-
-impl From<ed25519_dalek::SignatureError> for Error {
-    fn from(e: ed25519_dalek::SignatureError) -> Self {
-        Self::WrongKeyPair(e)
-    }
-}
-
-impl std::error::Error for Error {}

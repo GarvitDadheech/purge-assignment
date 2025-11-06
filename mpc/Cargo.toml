@@ -5,4 +5,24 @@ edition = "2024"
 
 [dependencies]
 actix-web = "4.11.0"
-tokio = "1.47.1"
+tokio = { version = "1.0", features = ["full"] }
+solana-sdk = "3.0.0"
+multi-party-eddsa = { git = "https://github.com/ZenGo-X/multi-party-eddsa", , branch = "master" }
+curv-kzen = "0.10.0"
+rand = "0.9.2"
+bs58 = "0.5.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.10.0", features = ["v4", "serde"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "offline"] }
+dotenv = "0.15.0"
+log = "0.4.22"
+env_logger = "0.11.4"
+thiserror = "2.0.16"
+store = { path = "../store" }
+solana-client = "3.0.1"
+chrono = "0.4"
+hex = "0.4.3"
+spl-memo = "6.0.0"
+
+[workspace]

@@ -1,18 +1,13 @@
+use crate::models::user::User;
 use crate::Store;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
-
-#[derive(Debug, Clone)]
-pub struct User {
-    pub id: String,
-    pub email: String,
-    pub created_at: String,
-}
+use bcrypt::{hash, DEFAULT_COST};
 
 #[derive(Debug)]
 pub struct CreateUserRequest {
     pub email: String,
     pub password: String,
+    pub public_key: String,
 }
 
 #[derive(Debug)]
@@ -20,6 +15,7 @@ pub enum UserError {
     UserExists,
     InvalidInput(String),
     DatabaseError(String),
+    PasswordHashingError(String),
 }
 
 impl std::fmt::Display for UserError {
@@ -28,6 +24,7 @@ impl std::fmt::Display for UserError {
             UserError::UserExists => write!(f, "User already exists"),
             UserError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             UserError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
+            UserError::PasswordHashingError(msg) => write!(f, "Password hashing error: {}", msg),
         }
     }
 }
@@ -36,55 +33,90 @@ impl std::error::Error for UserError {}
 
 impl Store {
     pub async fn create_user(&self, request: CreateUserRequest) -> Result<User, UserError> {
-        // Validate email format
         if !request.email.contains('@') {
             return Err(UserError::InvalidInput("Invalid email format".to_string()));
         }
 
-        // Validate password length
         if request.password.len() < 6 {
-            return Err(UserError::InvalidInput("Password must be at least 6 characters".to_string()));
+            return Err(UserError::InvalidInput(
+                "Password must be at least 6 characters".to_string(),
+            ));
         }
 
-        // Check if user already exists
-        let existing_user = sqlx::query!(
-            "SELECT id FROM users WHERE email = $1",
-            request.email
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| UserError::DatabaseError(e.to_string()))?;
+        let existing_user = self.get_user_by_email(&request.email).await?;
 
         if existing_user.is_some() {
             return Err(UserError::UserExists);
         }
 
-        // Hash the password
-        let password_hash = bcrypt::hash(&request.password, bcrypt::DEFAULT_COST)
-            .map_err(|e| UserError::DatabaseError(format!("Password hashing failed: {}", e)))?;
+        let password_hash = hash(&request.password, DEFAULT_COST)
+            .map_err(|e| UserError::PasswordHashingError(e.to_string()))?;
 
-        // Generate user ID and timestamp
-        let user_id = Uuid::new_v4().to_string();
-        let created_at = Utc::now();
-
-        // Insert user into database
-        sqlx::query!(
-            "INSERT INTO users (id, email, password_hash, created_at) VALUES ($1, $2, $3, $4)",
-            user_id,
+        let user = sqlx::query_as!(
+            User,
+            r#"
+            INSERT INTO users (email, password_hash, public_key)
+            VALUES ($1, $2, $3)
+            RETURNING id, email, password_hash, public_key, created_at, updated_at
+            "#,
             request.email,
             password_hash,
-            created_at
+            request.public_key
         )
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| UserError::DatabaseError(e.to_string()))?;
 
-        // Return the created user
-        let user = User {
-            id: user_id,
-            email: request.email,
-            created_at: created_at.to_rfc3339(),
-        };
+        Ok(user)
+    }
+
+    pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>, UserError> {
+        let user = sqlx::query_as!(
+            User,
+            r#"
+            SELECT id, email, password_hash, public_key, created_at, updated_at
+            FROM users
+            WHERE email = $1
+            "#,
+            email
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| UserError::DatabaseError(e.to_string()))?;
+
+        Ok(user)
+    }
+
+    pub async fn get_user_by_id(&self, user_id: Uuid) -> Result<Option<User>, UserError> {
+        let user = sqlx::query_as!(
+            User,
+            r#"
+            SELECT id, email, password_hash, public_key, created_at, updated_at
+            FROM users
+            WHERE id = $1
+            "#,
+            user_id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| UserError::DatabaseError(e.to_string()))?;
+
+        Ok(user)
+    }
+
+    pub async fn get_user_by_public_key(&self, public_key: &str) -> Result<Option<User>, UserError> {
+        let user = sqlx::query_as!(
+            User,
+            r#"
+            SELECT id, email, password_hash, public_key, created_at, updated_at
+            FROM users
+            WHERE public_key = $1
+            "#,
+            public_key
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| UserError::DatabaseError(e.to_string()))?;
 
         Ok(user)
     }
